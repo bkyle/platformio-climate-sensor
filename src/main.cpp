@@ -57,7 +57,7 @@ bool setupWiFi() {
   }
 
   WiFiManager wm;
-  wm.resetSettings();
+  // wm.resetSettings();
   ok = wm.autoConnect();
   if (!ok) {
     return false;
@@ -96,9 +96,9 @@ bool loadConfig() {
 
   DynamicJsonDocument doc(1024);
   DeserializationError err = deserializeJson(doc, file);
-  if (!err.code()) {
+  if (!err.code() == DeserializationError::Code::Ok) {
     file.close();
-    Log.errorln(err.f_str());
+    Log.errorln("Failed to load configuration. %s", err.f_str());
     return false;
   }
 
@@ -119,6 +119,9 @@ bool saveConfig() {
   doc["mqtt"]["broker"]["port"] = mqttBrokerPort;
   doc["mqtt"]["topic"] = mqttTopic;
   
+  serializeJsonPretty(doc, Serial);
+  Serial.println();
+
   File file = SPIFFS.open("/config.json", FILE_WRITE);
   if (!file) {
     return false;
@@ -126,6 +129,13 @@ bool saveConfig() {
 
   serializeJson(doc, file);
   file.close();
+
+  Log.infoln("Configuration saved.");
+
+  file = SPIFFS.open(F("/config.json"), FILE_READ);
+  Log.infoln("Size of config == %d", file.size());
+
+
   return true;
 }
 
@@ -153,6 +163,7 @@ bool reconnect() {
 }
 
 bool setupMqttClient() {
+  Log.infoln("Connecting to %s:%d", mqttBrokerHost, mqttBrokerPort);
   mqttClient.setServer(mqttBrokerHost, mqttBrokerPort);
   mqttClient.setCallback(callback);
 
@@ -164,17 +175,14 @@ bool setupMqttClient() {
 }
 
 bool setupWiFiManager() {
-  // wifiManager.resetSettings();
   wifiManager.addParameter(&mqttBrokerHostParameter);
   wifiManager.addParameter(&mqttBrokerPortParameter);
   wifiManager.addParameter(&mqttTopicParameter);
-  wifiManager.setSaveConfigCallback(saveConfig);
-  // wifiManager.setTitle("");
-  wifiManager.autoConnect();
-  // // wifiManager.autoConnect(ssid, password);
-  // wifiManager.setConfigPortalBlocking(false);
-  // wifiManager.setConfigPortalTimeout(60);
-  // wifiManager.startConfigPortal();
+  wifiManager.setSaveParamsCallback(saveConfig);
+  std::vector<const char*> menu = {"wifi", "param", "info", "update"};
+  wifiManager.setMenu(menu);
+  wifiManager.setConfigPortalBlocking(false);
+  wifiManager.startWebPortal();
   return true;
 }
 
@@ -203,34 +211,34 @@ void setup() {
 
   Log.begin(LOG_LEVEL_INFO, &Serial);
 
-  // ok = SPIFFS.begin(true);
-  // if (!ok) {
-  //   Log.errorln("Failed to initialize SPIFFS");
-  // }
+  ok = SPIFFS.begin(true);
+  if (!ok) {
+    Log.errorln("Failed to initialize SPIFFS");
+  }
 
-  // ok = loadConfig();
-  // if (!ok) {
-  //   Log.errorln("Failed to load configuration, loading defaults");
-  //   ok = loadDefaultConfig();
-  //   if (!ok) {
-  //     Log.fatalln("Failed to load default configuration");
-  //   }
-  // }
+  ok = loadConfig();
+  if (!ok) {
+    Log.errorln("Failed to load configuration, loading defaults");
+    ok = loadDefaultConfig();
+    if (!ok) {
+      Log.fatalln("Failed to load default configuration");
+    }
+  }
 
   ok = setupWiFi();
   if (!ok) {
     Log.errorln("Unable to establish WiFi connection");
   }
 
-  // ok = setupWiFiManager();
-  // if (!ok) {
-  //   Log.errorln("Unable to setup WiFi Manager");
-  // }
+  ok = setupWiFiManager();
+  if (!ok) {
+    Log.errorln("Unable to setup WiFi Manager");
+  }
 
-  // ok = setupMqttClient();
-  // if (!ok) {
-  //   Log.errorln("Unable to establish MQTT connection");
-  // }
+  ok = setupMqttClient();
+  if (!ok) {
+    Log.errorln("Unable to establish MQTT connection");
+  }
 
   ok = Wire.setPins(SDA, SCL);
   if (!ok) {
@@ -298,36 +306,24 @@ void loop() {
     logEvent(humidity, temperature);
     updateDisplay(humidity, temperature);
 
-    // String payload = "{\"temperature\":" + 
-    //   String(temperature.temperature) + 
-    //   ", \"humidity\":" + 
-    //   String(humidity.relative_humidity) +
-    //   "}";
+    String deviceId = String(F("device-")) + String(static_cast<long>(ESP.getEfuseMac()), HEX);
 
-    // char t[100];
-    // snprintf(t, sizeof(t), mqttTopic, String(getChipID(), HEX).c_str());
+    DynamicJsonDocument doc(1024);
+    doc[F("deviceId")] = deviceId;
+    doc[F("payload")][F("temperature")][F("value")] = temperature.temperature;
+    doc[F("payload")][F("temperature")][F("unit")] = String(F("C"));
+    doc[F("payload")][F("humidity")][F("value")] = humidity.relative_humidity;
+    doc[F("payload")][F("humidity")][F("unit")] = String(F("%"));
 
-    // if (!mqttClient.publish(t, payload.c_str())) {
-    //   Log.errorln("Failed to publish readings to %s:%d %s", mqttBrokerHost, mqttBrokerPort, t);
-    // }
+    String payload;
+    serializeJson(doc, payload);
+
+    char topic[255];
+    snprintf(topic, sizeof(topic), mqttTopic, deviceId.c_str());
+
+    if (!mqttClient.publish(topic, payload.c_str())) {
+      Log.errorln("Failed to publish readings to %s:%d %s", mqttBrokerHost, mqttBrokerPort, topic);
+    }
     reportTimeoutMillis = millis() + REPORT_INTERVAL;
   }
-
-  // FIXME: mqttClient appears to get into a state where it can no longer reconnect.
-  // Disconnecting after each iteration of the loop gets mqttClient into this state
-  // within a few iterations.
-  //
-  // Things to try:
-  //   1. mqtt.loop() before disconnect to see if there's state that doesn't get cleaned
-  //      up properly?
-  //   2. create a new instance of PubSubClient after disconnecting to try to clear out
-  //      stale state?
-  //   3. Add logging to PubSubClient to see where it's timing out.  This appears to be
-  //      happening inside of connect() after writing an initial header -- waiting for
-  //      bytes to be available.
-  //   4. Increase the timeout from the default (15 seconds?) to something extreme?
-  //
-  // mqttClient.disconnect();
-
-  // delay(2000);
 }
