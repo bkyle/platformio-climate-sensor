@@ -3,7 +3,7 @@
 
 class Sensors {
   private:
-    Adafruit_AHTX0 _AHT;
+    Adafruit_AHTX0* _AHT;
     sensors_event_t _temperature;
     sensors_event_t _humidity;
   public:
@@ -15,7 +15,7 @@ class Sensors {
 
     String toString();
 
-    bool begin(Adafruit_AHTX0 &AHT);
+    bool begin(Adafruit_AHTX0* AHT);
     bool loop();
 };
 

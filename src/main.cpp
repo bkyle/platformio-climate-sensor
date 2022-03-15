@@ -223,7 +223,7 @@ void setup() {
     Log.fatalln("AHT not available");
   }
 
-  if (!sensors.begin(aht)) {
+  if (!sensors.begin(&aht)) {
     Log.fatalln("Sensors not available");
   }
 

@@ -32,11 +32,11 @@ String Sensors::toString() {
     return payload;
 }
 
-bool Sensors::begin(Adafruit_AHTX0 &AHT) {
-    this->_AHT = AHT;
+bool Sensors::begin(Adafruit_AHTX0* AHT) {
+    _AHT = AHT;
     return true;
 }
 
 bool Sensors::loop() {
-    return _AHT.getEvent(&_humidity, &_temperature);
+    return _AHT->getEvent(&_humidity, &_temperature);
 }
