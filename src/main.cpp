@@ -1,3 +1,6 @@
+#include "config.h"
+#include "Sensors.h"
+#include "Interval.h"
 #include <Arduino.h>
 #include <SPIFFS.h>
 #include <ArduinoLog.h>
@@ -15,6 +18,7 @@ uint16_t mqttBrokerPort;
 char mqttTopic[64];
 
 Adafruit_AHTX0 aht;
+Sensors sensors;
 Adafruit_SSD1306 ssd1306 = Adafruit_SSD1306(128, 64);
 WiFiManager wifiManager;
 WiFiClient wifiClient;
@@ -24,7 +28,8 @@ WiFiManagerParameter mqttBrokerHostParameter("mqtt_broker_host", "MQTT Broker Se
 WiFiManagerParameter mqttBrokerPortParameter("mqtt_broker_port", "MQTT Broker Port", String(MQTT_BROKER_PORT).c_str(), String(MQTT_BROKER_PORT).length());
 WiFiManagerParameter mqttTopicParameter("mqtt_topic", "MQTT Topic (%s will be replaced with the device uid)", MQTT_TOPIC, strlen(MQTT_TOPIC));
 
-unsigned long reportTimeoutMillis = 0;
+Interval reportInterval(REPORT_INTERVAL);
+// unsigned long reportTimeoutMillis = 0;
 
 uint32_t getChipID() {
   uint32_t chipId = 0;
@@ -186,77 +191,52 @@ bool setupWiFiManager() {
   return true;
 }
 
-void listDirectory(const char *path) {
-  File root = SPIFFS.open(path);
-  if (!root.isDirectory()) {
-    Serial.printf("%s is not a directory\n", path);
-    return;
-  }
-
-  Serial.println("BEGIN");
-  File cur = root;
-  while (cur = cur.openNextFile()) {
-    Serial.printf("%s: %s, %d\n", cur.isDirectory() ? "DIR" : "FILE", cur.name(), cur.size());
-  }
-  Serial.println("END");
-}
 
 void setup() {
-  bool ok;
-  // randomSeed(micros());
-
-  // wifiManager.resetSettings();
-
   Serial.begin(115200);
 
   Log.begin(LOG_LEVEL_INFO, &Serial);
 
-  ok = SPIFFS.begin(true);
-  if (!ok) {
+  if (!SPIFFS.begin(true)) {
     Log.errorln("Failed to initialize SPIFFS");
   }
 
-  ok = loadConfig();
-  if (!ok) {
+  if(!loadConfig()) {
     Log.errorln("Failed to load configuration, loading defaults");
-    ok = loadDefaultConfig();
-    if (!ok) {
+    if (!loadDefaultConfig()) {
       Log.fatalln("Failed to load default configuration");
     }
   }
 
-  ok = setupWiFi();
-  if (!ok) {
+  if (!setupWiFi()) {
     Log.errorln("Unable to establish WiFi connection");
   }
 
-  ok = setupWiFiManager();
-  if (!ok) {
+  if (!setupWiFiManager()) {
     Log.errorln("Unable to setup WiFi Manager");
   }
 
-  ok = setupMqttClient();
-  if (!ok) {
-    Log.errorln("Unable to establish MQTT connection");
-  }
+  // if (!setupMqttClient()) {
+  //   Log.errorln("Unable to establish MQTT connection");
+  // }
 
-  ok = Wire.setPins(SDA, SCL);
-  if (!ok) {
+  if (!Wire.setPins(I2C_SDA, I2C_SCL)) {
     Log.fatalln("I2C pin configuration failed");
   }
 
-  ok = Wire.begin();
-  if (!ok) {
+  if (!Wire.begin()) {
     Log.fatalln("I2C initialized failed");
   }
 
-  ok = aht.begin();
-  if (!ok) {
+  if (!aht.begin()) {
     Log.fatalln("AHT not available");
   }
 
-  ok = ssd1306.begin(SSD1306_SWITCHCAPVCC, 0x3C, false, true);
-  if (!ok) {
+  if (!sensors.begin(aht)) {
+    Log.fatalln("Sensors not available");
+  }
+
+  if (!ssd1306.begin(SSD1306_SWITCHCAPVCC, 0x3C, false, true)) {
     Log.fatalln("SSD1306 not available");
   }
 
@@ -270,17 +250,24 @@ void logEvent(sensors_event_t &humidity, sensors_event_t &temperature) {
   );
 }
 
-void updateDisplay(sensors_event_t &humidity, sensors_event_t &temperature) {
+void updateDisplay() {
   ssd1306.clearDisplay();
   ssd1306.setTextColor(SSD1306_WHITE);
-  ssd1306.setCursor(0, 20);
 
+  ssd1306.setCursor(0, 0);
+  if (WiFi.isConnected()) {
+    ssd1306.print(WiFi.localIP());
+  } else {
+    ssd1306.print("No Connection");
+  }
+
+  ssd1306.setCursor(0, 20);
   ssd1306.print("Temperature: ");
-  ssd1306.print(temperature.temperature);
+  ssd1306.print(sensors.getTemperature());
   ssd1306.println(" C");
   ssd1306.println();
   ssd1306.print("   Humidity: ");
-  ssd1306.print(humidity.relative_humidity);
+  ssd1306.print(sensors.getHumidity());
   ssd1306.println(" %");
 
   ssd1306.display();
@@ -293,37 +280,36 @@ void loop() {
   //   setupWiFiClient();
   // }
 
-  if (!mqttClient.connected()) {
-    reconnect();
-  }
-  mqttClient.loop();
+  // if (!mqttClient.connected()) {
+  //   reconnect();
+  // }
+  // mqttClient.loop();
 
+  sensors.loop();
 
-  if (millis() > reportTimeoutMillis) {
-    sensors_event_t humidity, temperature;
-    aht.getEvent(&humidity, &temperature);
+  if (reportInterval.check()) {
+    Serial.println(sensors.toString());
 
-    logEvent(humidity, temperature);
-    updateDisplay(humidity, temperature);
+    updateDisplay();
+    // publishState(humidity, temperature);
 
-    String deviceId = String(F("device-")) + String(static_cast<long>(ESP.getEfuseMac()), HEX);
+    // String deviceId = String(F("device-")) + String(static_cast<long>(ESP.getEfuseMac()), HEX);
 
-    DynamicJsonDocument doc(1024);
-    doc[F("deviceId")] = deviceId;
-    doc[F("payload")][F("temperature")][F("value")] = temperature.temperature;
-    doc[F("payload")][F("temperature")][F("unit")] = String(F("C"));
-    doc[F("payload")][F("humidity")][F("value")] = humidity.relative_humidity;
-    doc[F("payload")][F("humidity")][F("unit")] = String(F("%"));
+    // DynamicJsonDocument doc(1024);
+    // doc[F("deviceId")] = deviceId;
+    // doc[F("payload")][F("temperature")][F("value")] = temperature.temperature;
+    // doc[F("payload")][F("temperature")][F("unit")] = String(F("C"));
+    // doc[F("payload")][F("humidity")][F("value")] = humidity.relative_humidity;
+    // doc[F("payload")][F("humidity")][F("unit")] = String(F("%"));
 
-    String payload;
-    serializeJson(doc, payload);
+    // String payload;
+    // serializeJson(doc, payload);
 
-    char topic[255];
-    snprintf(topic, sizeof(topic), mqttTopic, deviceId.c_str());
+    // char topic[255];
+    // snprintf(topic, sizeof(topic), mqttTopic, deviceId.c_str());
 
-    if (!mqttClient.publish(topic, payload.c_str())) {
-      Log.errorln("Failed to publish readings to %s:%d %s", mqttBrokerHost, mqttBrokerPort, topic);
-    }
-    reportTimeoutMillis = millis() + REPORT_INTERVAL;
+    // if (!mqttClient.publish(topic, payload.c_str())) {
+    //   Log.errorln("Failed to publish readings to %s:%d %s", mqttBrokerHost, mqttBrokerPort, topic);
+    // }
   }
 }
