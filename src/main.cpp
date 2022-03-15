@@ -29,15 +29,6 @@ WiFiManagerParameter mqttBrokerPortParameter("mqtt_broker_port", "MQTT Broker Po
 WiFiManagerParameter mqttTopicParameter("mqtt_topic", "MQTT Topic (%s will be replaced with the device uid)", MQTT_TOPIC, strlen(MQTT_TOPIC));
 
 Interval reportInterval(REPORT_INTERVAL);
-// unsigned long reportTimeoutMillis = 0;
-
-uint32_t getChipID() {
-  uint32_t chipId = 0;
-  for (int i=0; i<17; i++) {
-    chipId |= ((ESP.getEfuseMac() >> (40 - i)) & 0xff) << i;
-  }
-  return chipId;
-}
 
 void callback(char *topic, byte *payload, uint32_t length) {
   char *msg = (char*) malloc(sizeof(char) * length + 1);
@@ -45,10 +36,6 @@ void callback(char *topic, byte *payload, uint32_t length) {
   msg[length] = 0;
   Log.infoln("MESSAGE %s", msg);
   free(msg);
-}
-
-bool timeoutExceeded(unsigned long startMillis, unsigned long timeoutMillis) {
-  return (millis() - startMillis > timeoutMillis);
 }
 
 bool setupWiFi() {
@@ -289,7 +276,6 @@ void loop() {
 
   if (reportInterval.check()) {
     Serial.println(sensors.toString());
-
     updateDisplay();
     // publishState(humidity, temperature);
 
