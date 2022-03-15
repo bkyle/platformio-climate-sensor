@@ -1,6 +1,7 @@
 #include "config.h"
 #include "Sensors.h"
 #include "Interval.h"
+#include "Display.h"
 #include <Arduino.h>
 #include <SPIFFS.h>
 #include <ArduinoLog.h>
@@ -19,6 +20,7 @@ char mqttTopic[64];
 
 Adafruit_AHTX0 aht;
 Sensors sensors;
+Display display;
 Adafruit_SSD1306 ssd1306 = Adafruit_SSD1306(128, 64);
 WiFiManager wifiManager;
 WiFiClient wifiClient;
@@ -28,6 +30,8 @@ WiFiManagerParameter mqttBrokerHostParameter("mqtt_broker_host", "MQTT Broker Se
 WiFiManagerParameter mqttBrokerPortParameter("mqtt_broker_port", "MQTT Broker Port", String(MQTT_BROKER_PORT).c_str(), String(MQTT_BROKER_PORT).length());
 WiFiManagerParameter mqttTopicParameter("mqtt_topic", "MQTT Topic (%s will be replaced with the device uid)", MQTT_TOPIC, strlen(MQTT_TOPIC));
 
+Interval sensorInterval(REPORT_INTERVAL);
+Interval displayInterval(1000);
 Interval reportInterval(REPORT_INTERVAL);
 
 void callback(char *topic, byte *payload, uint32_t length) {
@@ -227,6 +231,10 @@ void setup() {
     Log.fatalln("SSD1306 not available");
   }
 
+  if (!display.begin(&ssd1306, &sensors)) {
+    Log.fatalln("Unable to initialize display");
+  }
+
 }
 
 void logEvent(sensors_event_t &humidity, sensors_event_t &temperature) {
@@ -235,29 +243,6 @@ void logEvent(sensors_event_t &humidity, sensors_event_t &temperature) {
     temperature.temperature,
     humidity.relative_humidity
   );
-}
-
-void updateDisplay() {
-  ssd1306.clearDisplay();
-  ssd1306.setTextColor(SSD1306_WHITE);
-
-  ssd1306.setCursor(0, 0);
-  if (WiFi.isConnected()) {
-    ssd1306.print(WiFi.localIP());
-  } else {
-    ssd1306.print("No Connection");
-  }
-
-  ssd1306.setCursor(0, 20);
-  ssd1306.print("Temperature: ");
-  ssd1306.print(sensors.getTemperature());
-  ssd1306.println(" C");
-  ssd1306.println();
-  ssd1306.print("   Humidity: ");
-  ssd1306.print(sensors.getHumidity());
-  ssd1306.println(" %");
-
-  ssd1306.display();
 }
 
 void loop() {
@@ -272,13 +257,16 @@ void loop() {
   // }
   // mqttClient.loop();
 
+  if (sensorInterval.check()) {
   sensors.loop();
+  }
+
+  if (displayInterval.check()) {
+    display.loop();
+  }
 
   if (reportInterval.check()) {
     Serial.println(sensors.toString());
-    updateDisplay();
-    // publishState(humidity, temperature);
-
     // String deviceId = String(F("device-")) + String(static_cast<long>(ESP.getEfuseMac()), HEX);
 
     // DynamicJsonDocument doc(1024);
