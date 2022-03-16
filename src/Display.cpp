@@ -4,10 +4,16 @@
 
 void Display::renderStatusArea() {
     _GFX->setCursor(0, 0);
-    if (WiFi.isConnected()) {
-        _GFX->print(WiFi.localIP());
+    if (_connectivity->hasNetworkConnection()) {
+        _GFX->println(_connectivity->getIPAddress());
     } else {
-        _GFX->print("Not Connected");
+        _GFX->println("Not Connected");
+    }
+
+    if (_connectivity->hasMessagingConnection()) {
+        _GFX->println("Connected");
+    } else {
+        _GFX->println("Not Connected");
     }
 }
 
@@ -22,9 +28,10 @@ void Display::renderContentArea() {
     _GFX->println(" %");
 }
 
-bool Display::begin(Adafruit_SSD1306* GFX, Sensors* sensors) {
+bool Display::begin(Adafruit_SSD1306* GFX, Sensors* sensors, Connectivity* connectivity) {
     _GFX = GFX;
     _sensors = sensors;
+    _connectivity = connectivity;
     return true;
 }
 

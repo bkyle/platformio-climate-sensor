@@ -1,6 +1,7 @@
 #include "config.h"
 #include "Sensors.h"
 #include "Interval.h"
+#include "Connectivity.h"
 #include "Display.h"
 #include <Arduino.h>
 #include <SPIFFS.h>
@@ -25,6 +26,7 @@ Adafruit_SSD1306 ssd1306 = Adafruit_SSD1306(128, 64);
 WiFiManager wifiManager;
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
+Connectivity connectivity;
 
 WiFiManagerParameter mqttBrokerHostParameter("mqtt_broker_host", "MQTT Broker Server", MQTT_BROKER_HOST, strlen(MQTT_BROKER_HOST));
 WiFiManagerParameter mqttBrokerPortParameter("mqtt_broker_port", "MQTT Broker Port", String(MQTT_BROKER_PORT).c_str(), String(MQTT_BROKER_PORT).length());
@@ -231,7 +233,11 @@ void setup() {
     Log.fatalln("SSD1306 not available");
   }
 
-  if (!display.begin(&ssd1306, &sensors)) {
+  if (!connectivity.begin(&mqttClient)) {
+    Log.fatalln("MQTT Client not available");
+  }
+
+  if (!display.begin(&ssd1306, &sensors, &connectivity)) {
     Log.fatalln("Unable to initialize display");
   }
 
