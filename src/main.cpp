@@ -1,295 +1,243 @@
 #include "config.h"
-#include "Sensors.h"
-#include "Interval.h"
-#include "Connectivity.h"
-#include "Display.h"
-#include <Arduino.h>
-#include <SPIFFS.h>
-#include <ArduinoLog.h>
+
+#include <WiFi.h>
+#if MQTT_USE_TLS
+  #include <WiFiClientSecure.h>
+#endif
+#include <ArduinoJson.h>
+#include <PubSubClient.h>
 #include <Adafruit_AHTX0.h>
 #include <Adafruit_SSD1306.h>
-#include <WiFi.h>
 #include <WiFiManager.h>
-#include <PubSubClient.h>
-#include <ArduinoJson.h>
+#include <ESP_DoubleResetDetector.h>
 
-#include "config.h"
+//
+// Constants initialized at runtime.
+//
 
-char mqttBrokerHost[64];
-uint16_t mqttBrokerPort;
-char mqttTopic[64];
+// The unique identifier for the device.
+char DEVICE_ID[16];
 
-Adafruit_AHTX0 aht;
-Sensors sensors;
-Display display;
-Adafruit_SSD1306 ssd1306 = Adafruit_SSD1306(128, 64);
-WiFiManager wifiManager;
-WiFiClient wifiClient;
-PubSubClient mqttClient(wifiClient);
-Connectivity connectivity;
+// Name of the topic that messages will be published to.
+char TOPIC[sizeof(MQTT_TOPIC_PREFIX) + sizeof(DEVICE_ID) + 1];
 
-WiFiManagerParameter mqttBrokerHostParameter("mqtt_broker_host", "MQTT Broker Server", MQTT_BROKER_HOST, strlen(MQTT_BROKER_HOST));
-WiFiManagerParameter mqttBrokerPortParameter("mqtt_broker_port", "MQTT Broker Port", String(MQTT_BROKER_PORT).c_str(), String(MQTT_BROKER_PORT).length());
-WiFiManagerParameter mqttTopicParameter("mqtt_topic", "MQTT Topic (%s will be replaced with the device uid)", MQTT_TOPIC, strlen(MQTT_TOPIC));
+//
+// Runtime variables
+//
+bool             initializing     = true;
+sensors_event_t  temperature;
+sensors_event_t  relativeHumidity;
 
-Interval sensorInterval(REPORT_INTERVAL);
-Interval displayInterval(1000);
-Interval reportInterval(REPORT_INTERVAL);
+// Value of millis() when the screen was "turned on"
+volatile unsigned long    callupMillis = millis();
+enum { OFF, ON }          callupState  = OFF;
 
-void callback(char *topic, byte *payload, uint32_t length) {
-  char *msg = (char*) malloc(sizeof(char) * length + 1);
-  strncpy(msg, (char*)payload, length);
-  msg[length] = 0;
-  Log.infoln("MESSAGE %s", msg);
-  free(msg);
+DoubleResetDetector drd(DRD_RESET_TIMEOUT_MS / 1000, 0x0);
+WiFiManager         wm;
+PubSubClient        MQTT;
+Adafruit_AHTX0      AHT10;
+Adafruit_SSD1306    SSD1306(128, 64);
+
+
+int die(const String& msg) {
+  Serial.println(msg);
+  Serial.flush();
+  while(true);
+  return 1;
 }
 
-bool setupWiFi() {
-  bool ok;
-
-  // Set to APSTA mode so that wm.autoConnect() can start an access point if there
-  // isn't a persisted Wifi configuration.
-  ok = WiFi.mode(WIFI_MODE_APSTA);
-  if (!ok) {
-    return false;
-  }
-
-  WiFiManager wm;
-  // wm.resetSettings();
-  ok = wm.autoConnect();
-  if (!ok) {
-    return false;
-  }
-
-  ok = WiFi.disconnect();
-  if (!ok) {
-    return false;
-  }
-
-  ok = WiFi.mode(WIFI_MODE_STA);
-  if (!ok) {
-    return false;
-  }
-
-  ok = WiFi.begin();
-  if (!ok) {
-    return false;
-  }
-
-  return true;
+void callup() {
+  callupMillis = millis();
 }
 
-bool loadDefaultConfig() {
-  strlcpy(mqttBrokerHost, MQTT_BROKER_HOST, sizeof(mqttBrokerHost));
-  mqttBrokerPort = MQTT_BROKER_PORT;
-  strlcpy(mqttTopic, MQTT_TOPIC, sizeof(mqttTopic));
-  return true;
-}
-
-bool loadConfig() {
-  File file = SPIFFS.open("/config.json", FILE_READ);
-  if (!file) {
-    return false;
-  }
-
-  DynamicJsonDocument doc(1024);
-  DeserializationError err = deserializeJson(doc, file);
-  if (!err.code() == DeserializationError::Code::Ok) {
-    file.close();
-    Log.errorln("Failed to load configuration. %s", err.f_str());
-    return false;
-  }
-
-  file.close();
-
-  serializeJsonPretty(doc, Serial);
-
-  strlcpy(mqttBrokerHost, doc["mqtt"]["broker"]["host"] | MQTT_BROKER_HOST, sizeof(mqttBrokerHost));
-  mqttBrokerPort = doc["mqtt"]["broker"]["port"] | MQTT_BROKER_PORT;
-  strlcpy(mqttTopic, doc["mqtt"]["topic"] | MQTT_TOPIC, sizeof(mqttTopic));
-
-  return true;
-}
-
-bool saveConfig() {
-  DynamicJsonDocument doc(1024);
-  doc["mqtt"]["broker"]["host"] = mqttBrokerHost;
-  doc["mqtt"]["broker"]["port"] = mqttBrokerPort;
-  doc["mqtt"]["topic"] = mqttTopic;
-  
-  serializeJsonPretty(doc, Serial);
-  Serial.println();
-
-  File file = SPIFFS.open("/config.json", FILE_WRITE);
-  if (!file) {
-    return false;
-  }
-
-  serializeJson(doc, file);
-  file.close();
-
-  Log.infoln("Configuration saved.");
-
-  file = SPIFFS.open(F("/config.json"), FILE_READ);
-  Log.infoln("Size of config == %d", file.size());
-
-
-  return true;
-}
-
-String generateMqttClientId() {
-  String clientId = "ESP32-";
-  clientId += String((long)ESP.getEfuseMac(), HEX);
-  clientId += "-";
-  clientId += String(random(0xffff), HEX);
-  return clientId;
-}
-
-bool reconnect() {
-  int retries = 0;
-  while (!mqttClient.connected()) {
-    String clientId = generateMqttClientId();
-    if (!mqttClient.connect(clientId.c_str())) {
-      retries++;
-      if (retries > MQTT_MAX_RETRIES) {
+void drawStatusArea() {
+  char status[64];
+  if (initializing) {
+    snprintf(status, sizeof(status), "Starting...");
+  } else {
+    switch (WiFi.status()) {
+      case WL_NO_SHIELD:
+      case WL_NO_SSID_AVAIL:
+      case WL_CONNECT_FAILED:
+      case WL_CONNECTION_LOST:
+      case WL_DISCONNECTED:
+        snprintf(status, sizeof(status), "No Connection");
         break;
-      }
-      delay(5000);
+      case WL_CONNECTED:
+        snprintf(status, sizeof(status), WiFi.localIP().toString().c_str());
+        break;
+      default:
+        snprintf(status, sizeof(status), "");
+        break;
     }
   }
-  return mqttClient.connected();
+  
+  SSD1306.setCursor(0, 0);
+  SSD1306.setTextSize(1);
+  SSD1306.println(status);
 }
 
-bool setupMqttClient() {
-  Log.infoln("Connecting to %s:%d", mqttBrokerHost, mqttBrokerPort);
-  mqttClient.setServer(mqttBrokerHost, mqttBrokerPort);
-  mqttClient.setCallback(callback);
+void drawContentArea() {
+  char temperatureStr[8];
+  char relativeHumidityStr[8];
 
-  if (!mqttClient.connected()) {
-    reconnect();
+  if (initializing) {
+    snprintf(temperatureStr, sizeof(temperatureStr), "--.-");
+    snprintf(relativeHumidityStr, sizeof(relativeHumidityStr), "--.-");
+  } else {
+    snprintf(temperatureStr, sizeof(temperatureStr), "%2.1f", temperature.temperature);
+    snprintf(relativeHumidityStr, sizeof(relativeHumidityStr), "%2.1f", relativeHumidity.relative_humidity);
   }
+  
+  const int S = 1;
+  const int L = 2;
+  SSD1306.setCursor(0, 20);
+  SSD1306.setTextSize(L); SSD1306.print(temperatureStr);
+  SSD1306.setTextSize(S); SSD1306.print("C");  
+  SSD1306.setTextSize(L); SSD1306.println();
 
-  return true;
+  SSD1306.setCursor(0, 38);
+  SSD1306.setTextSize(L); SSD1306.print(relativeHumidityStr);
+  SSD1306.setTextSize(S); SSD1306.print("%");  
+  SSD1306.setTextSize(L); SSD1306.println();
 }
 
-bool setupWiFiManager() {
-  wifiManager.addParameter(&mqttBrokerHostParameter);
-  wifiManager.addParameter(&mqttBrokerPortParameter);
-  wifiManager.addParameter(&mqttTopicParameter);
-  wifiManager.setSaveParamsCallback(saveConfig);
-  std::vector<const char*> menu = {"wifi", "param", "info", "update"};
-  wifiManager.setMenu(menu);
-  wifiManager.setConfigPortalBlocking(false);
-  wifiManager.startWebPortal();
-  return true;
+void updateDisplay() {
+  if (callupMillis + CALLUP_TIMEOUT_MS > millis()) {
+    callupState = ON;
+    SSD1306.clearDisplay();
+    drawStatusArea();
+    drawContentArea();
+    SSD1306.display();
+  } else if (callupState == ON && callupMillis + CALLUP_TIMEOUT_MS < millis()) {
+    callupState = OFF;
+    SSD1306.clearDisplay();
+    SSD1306.display();
+  }
 }
-
 
 void setup() {
   Serial.begin(115200);
-
-  Log.begin(LOG_LEVEL_INFO, &Serial);
-
-  if (!SPIFFS.begin(true)) {
-    Log.errorln("Failed to initialize SPIFFS");
+  
+  // Check for a double-reset indicating that the device should be restored to its default state.
+  if (DRD_RESET_TIMEOUT_MS > 0 && drd.detectDoubleReset()) {
+    wm.resetSettings();
   }
 
-  if(!loadConfig()) {
-    Log.errorln("Failed to load configuration, loading defaults");
-    if (!loadDefaultConfig()) {
-      Log.fatalln("Failed to load default configuration");
-    }
-  }
 
-  if (!setupWiFi()) {
-    Log.errorln("Unable to establish WiFi connection");
-  }
+  // Add the interrupt handler for the callup button.
+  pinMode(CALLUP_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(CALLUP_PIN), callup, FALLING);
 
-  if (!setupWiFiManager()) {
-    Log.errorln("Unable to setup WiFi Manager");
-  }
 
-  // if (!setupMqttClient()) {
-  //   Log.errorln("Unable to establish MQTT connection");
-  // }
+  // Initialize runtime constants
+  snprintf(DEVICE_ID, sizeof(DEVICE_ID), "%012llx", ESP.getEfuseMac());
+  snprintf(TOPIC, sizeof(TOPIC), "%s%s", MQTT_TOPIC_PREFIX, DEVICE_ID);
 
-  if (!Wire.setPins(I2C_SDA, I2C_SCL)) {
-    Log.fatalln("I2C pin configuration failed");
-  }
 
-  if (!Wire.begin()) {
-    Log.fatalln("I2C initialized failed");
-  }
+  // Setup peripherals
+  Wire.setPins(SDA_PIN, SCL_PIN) || die(F("I2C pin configuration failed"));
+  Wire.begin() || die(F("I2C initialized failed"));
+  AHT10.begin() || die(F("AHT not available"));
+  SSD1306.begin(SSD1306_SWITCHCAPVCC, 0x3C, false, true) || die(F("SSD1306 not available"));
+  SSD1306.setTextColor(SSD1306_WHITE);
+  updateDisplay();
 
-  if (!aht.begin()) {
-    Log.fatalln("AHT not available");
-  }
 
-  if (!sensors.begin(&aht)) {
-    Log.fatalln("Sensors not available");
-  }
+  // Configure the WiFi Manager
+  std::vector<const char*> menu = {"wifi", "param", "info", "update"};
+  wm.setMenu(menu);
+  wm.setSaveConfigCallback(callup);
+  wm.setConfigPortalBlocking(false);
 
-  if (!ssd1306.begin(SSD1306_SWITCHCAPVCC, 0x3C, false, true)) {
-    Log.fatalln("SSD1306 not available");
-  }
 
-  if (!connectivity.begin(&mqttClient)) {
-    Log.fatalln("MQTT Client not available");
-  }
+  // Attempt to connect to the WiFi network using the stored credentials.  If this is unsucessful
+  // then the configuration portal will automatically be started.
+  wm.autoConnect();
 
-  if (!display.begin(&ssd1306, &sensors, &connectivity)) {
-    Log.fatalln("Unable to initialize display");
-  }
 
-}
+  // Setup WiFiClient (or WiFiClientSecure) and MQTT
+  Client* client;
+  #if MQTT_USE_TLS
+    client = new WiFiClientSecure();
+    static_cast<WiFiClientSecure*>(client)->setCACert(MQTT_CA_CERT);
+  #else
+    client = new WiFiClient();
+  #endif
+  MQTT.setClient(*client);
+  MQTT.setServer(MQTT_BROKER, MQTT_PORT);
+  MQTT.setSocketTimeout(1);
 
-void logEvent(sensors_event_t &humidity, sensors_event_t &temperature) {
-  Serial.printf(
-    "Temperature:%f Humidity:%f\n",
-    temperature.temperature,
-    humidity.relative_humidity
-  );
+
+  // Indicate that setup() is complete.
+  initializing = false;
 }
 
 void loop() {
-  wifiManager.process();
+  // Clean up the Double Reset Detector state.
+  drd.loop();
 
-  // if (!WiFi.isConnected()) {
-  //   setupWiFiClient();
-  // }
 
-  // if (!mqttClient.connected()) {
-  //   reconnect();
-  // }
-  // mqttClient.loop();
+  // Do WiFiManager related processing.
+  wm.process();
 
-  if (sensorInterval.check()) {
-  sensors.loop();
+
+  // The config portal (not to be confused with the web portal) will be started automatically
+  // from wm.autoConnect() in setup() if a connection cannot be made.  The web portal is
+  // started to allow re-configuration.
+  wm.startWebPortal();
+
+
+  // Connect to the MQTT broker if not already connected.  This will block until a connection
+  // has been established.
+  if (WiFi.isConnected() && !MQTT.connected()) {
+    Serial.printf("Connecting to %s:%d...", MQTT_BROKER, MQTT_PORT);
+    char clientId[64];
+    snprintf(clientId, sizeof(clientId), "device-%s-%x", DEVICE_ID, random() * 1000);
+    Serial.print(".");
+    MQTT.connect(clientId, MQTT_USERNAME, MQTT_PASSWORD);
+    if (!MQTT.connected()) {
+      delay(5000);
+    } else {
+      Serial.println("Connected.");
+    }
   }
 
-  if (displayInterval.check()) {
-    display.loop();
+
+  // Do MQTT protocol related processing.
+  MQTT.loop();
+
+
+  // Read sensors, update the display, and publish messages if a reasonable amount of
+  // time has passed.
+  static unsigned long lastUpdateMillis = 0;
+  if (lastUpdateMillis == 0 || millis() > lastUpdateMillis + UPDATE_INTERVAL_MS) {
+    // Read the values from the sensor
+    AHT10.getEvent(&relativeHumidity, &temperature);
+
+    lastUpdateMillis = millis();
+
+    // Build the MQTT message
+    static unsigned long sequence = 0;
+    String message;
+    DynamicJsonDocument doc(1024);
+    doc[F("deviceId")] = DEVICE_ID;
+    doc[F("sequence")] = ++sequence;
+    doc[F("payload")][F("temperature")][F("value")] = temperature.temperature;
+    doc[F("payload")][F("temperature")][F("unit")] = F("C");
+    doc[F("payload")][F("humidity")][F("value")] = relativeHumidity.relative_humidity;
+    doc[F("payload")][F("humidity")][F("unit")] = F("%");
+    doc[F("payload")][F("rssi")][F("value")] = WiFi.RSSI();
+    doc[F("payload")][F("rssi")][F("unit")] = F("dBm");
+    serializeJson(doc, message);
+  
+    // Send the message to the MQTT broker and serial.
+    Serial.println(message);
+    MQTT.publish(TOPIC, message.c_str());
   }
 
-  if (reportInterval.check()) {
-    Serial.println(sensors.toString());
-    // String deviceId = String(F("device-")) + String(static_cast<long>(ESP.getEfuseMac()), HEX);
 
-    // DynamicJsonDocument doc(1024);
-    // doc[F("deviceId")] = deviceId;
-    // doc[F("payload")][F("temperature")][F("value")] = temperature.temperature;
-    // doc[F("payload")][F("temperature")][F("unit")] = String(F("C"));
-    // doc[F("payload")][F("humidity")][F("value")] = humidity.relative_humidity;
-    // doc[F("payload")][F("humidity")][F("unit")] = String(F("%"));
-
-    // String payload;
-    // serializeJson(doc, payload);
-
-    // char topic[255];
-    // snprintf(topic, sizeof(topic), mqttTopic, deviceId.c_str());
-
-    // if (!mqttClient.publish(topic, payload.c_str())) {
-    //   Log.errorln("Failed to publish readings to %s:%d %s", mqttBrokerHost, mqttBrokerPort, topic);
-    // }
-  }
+  // Update the information displayed on screen, or turn the screen off if the callup
+  // has expired.
+  updateDisplay();
 }
